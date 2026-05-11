@@ -163,31 +163,16 @@ def compute_vif(df_model, ind_vars):
 
 def detect_outlier_rows(df):
     """
-    Detect rows that are likely outliers or aggregate rows.
+    Detect statistical outlier rows (aggregate/total rows are already removed at import).
     Returns list of dicts: {index, label, reason, severity}
-    - 'TOTAL'/'SUM'/'TONG' aggregate rows -> severity='aggregate'
     - Statistical outliers via IQR (> 3*IQR) -> severity='extreme'
     """
     suspects = []
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-
-    # --- Aggregate / totals rows: check first text column for keywords ----
     text_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
-    AGG_KEYWORDS = ['total', 'tong', 'tổng', 'sum', 'grand', 'subtotal', 'average', 'mean']
-    for idx, row in df.iterrows():
-        for tc in text_cols:
-            cell = str(row[tc]).strip().lower()
-            if any(kw in cell for kw in AGG_KEYWORDS):
-                suspects.append({
-                    'index': idx,
-                    'label': f"{tc}={row[tc]}",
-                    'reason': f"Dòng tổng hợp ('{row[tc]}') — không phải quan sát thực",
-                    'severity': 'aggregate'
-                })
-                break  # one flag per row is enough
 
-    # --- Statistical extreme outliers: Z-score > 4 in any numeric col ----
-    already_flagged = {s['index'] for s in suspects}
+    # --- Statistical extreme outliers only (aggregate rows removed at import) ----
+    already_flagged = set()
     for col in numeric_cols:
         col_data = df[col].dropna()
         if len(col_data) < 4:
@@ -302,6 +287,24 @@ def load_data(uploaded_file):
 
     # Strip whitespace from column names
     df.columns = [str(c).strip() for c in df.columns]
+
+    # Auto-remove aggregate/total rows (TOTAL, SUM, TỔNG…) at import time
+    AGG_KW = ['total', 'tong', 'tổng', 'sum', 'grand total', 'subtotal', 'cộng', 'grand']
+    text_cols = df.select_dtypes(exclude=['number']).columns.tolist()
+    agg_mask = pd.Series(False, index=df.index)
+    for tc in text_cols:
+        cell_lower = df[tc].astype(str).str.strip().str.lower()
+        agg_mask |= cell_lower.isin(AGG_KW)
+        # also catch cells that START with these keywords (e.g. "Total votes")
+        for kw in AGG_KW:
+            agg_mask |= cell_lower.str.startswith(kw)
+    n_removed = agg_mask.sum()
+    if n_removed > 0:
+        removed_labels = df.loc[agg_mask, text_cols[0]].tolist() if text_cols else []
+        df = df[~agg_mask].reset_index(drop=True)
+        st.session_state["_agg_rows_removed"] = removed_labels
+    else:
+        st.session_state["_agg_rows_removed"] = []
 
     # Coerce columns that look numeric but were read as object
     for col in df.columns:
@@ -954,6 +957,10 @@ with st.sidebar:
                 st.caption(f"{df_loaded.shape[0]} hàng × {df_loaded.shape[1]} cột")
                 if hdr_row > 0:
                     st.info(f"📌 Tự phát hiện header tại dòng {hdr_row + 1}")
+                removed = st.session_state.get("_agg_rows_removed", [])
+                if removed:
+                    labels = ", ".join(f'"{r}"' for r in removed)
+                    st.warning(f"🗑️ Tự động loại {len(removed)} dòng tổng hợp: {labels}")
         except Exception as e:
             st.error(f"Lỗi đọc file: {e}")
 
