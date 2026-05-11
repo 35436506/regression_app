@@ -758,7 +758,10 @@ with st.expander("🤖 Gợi ý biến tự động (click để xem / ẩn)", e
             except Exception:
                 return ""
 
-        styled = corr_df.style.applymap(color_corr, subset=[f"Tương quan với {sug_y}"])
+        try:
+            styled = corr_df.style.map(color_corr, subset=[f"Tương quan với {sug_y}"])
+        except AttributeError:
+            styled = corr_df.style.applymap(color_corr, subset=[f"Tương quan với {sug_y}"])
         st.dataframe(styled, use_container_width=True, hide_index=True, height=min(200, 35 * len(corr_df) + 38))
         st.caption("🟢 |r| ≥ 0.7 mạnh · 🟡 0.4–0.7 trung bình · ⬜ < 0.4 yếu")
 
