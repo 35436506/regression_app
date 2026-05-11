@@ -288,23 +288,21 @@ def load_data(uploaded_file):
     # Strip whitespace from column names
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Auto-remove aggregate/total rows (TOTAL, SUM, TỔNG…) at import time
-    AGG_KW = ['total', 'tong', 'tổng', 'sum', 'grand total', 'subtotal', 'cộng', 'grand']
+    # Auto-remove aggregate/total rows at import — only check the LAST row
+    # (avoids false positives like "Sumter", "Subtotal County", etc.)
+    AGG_KW = {'total', 'tong', 'tổng', 'sum', 'grand total', 'subtotal', 'cộng', 'grand'}
     text_cols = df.select_dtypes(exclude=['number']).columns.tolist()
-    agg_mask = pd.Series(False, index=df.index)
-    for tc in text_cols:
-        cell_lower = df[tc].astype(str).str.strip().str.lower()
-        agg_mask |= cell_lower.isin(AGG_KW)
-        # also catch cells that START with these keywords (e.g. "Total votes")
-        for kw in AGG_KW:
-            agg_mask |= cell_lower.str.startswith(kw)
-    n_removed = agg_mask.sum()
-    if n_removed > 0:
-        removed_labels = df.loc[agg_mask, text_cols[0]].tolist() if text_cols else []
-        df = df[~agg_mask].reset_index(drop=True)
-        st.session_state["_agg_rows_removed"] = removed_labels
-    else:
-        st.session_state["_agg_rows_removed"] = []
+    removed_labels = []
+    if len(df) > 0 and text_cols:
+        last_idx = df.index[-1]
+        last_row_is_agg = any(
+            str(df.at[last_idx, tc]).strip().lower() in AGG_KW
+            for tc in text_cols
+        )
+        if last_row_is_agg:
+            removed_labels = [str(df.at[last_idx, text_cols[0]])]
+            df = df.iloc[:-1].reset_index(drop=True)
+    st.session_state["_agg_rows_removed"] = removed_labels
 
     # Coerce columns that look numeric but were read as object
     for col in df.columns:
