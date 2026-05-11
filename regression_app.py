@@ -95,14 +95,130 @@ DEFAULTS = {
     "df": None,
     "filename": "",
     "header_row": 0,
-    "run_history": [],      # list of result dicts per run
+    "run_history": [],
     "run_counter": 0,
+    "outlier_rows": [],
+    "excluded_rows": set(),
+    "outlier_checked": False,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # ── Helper utilities ───────────────────────────────────────────────────────
+
+def compute_vif(df_model, ind_vars):
+    """
+    Compute Variance Inflation Factor for each predictor.
+    Returns DataFrame with columns: Biến, VIF, Mức độ
+    Also returns a bool: has_high_vif (VIF > 10 for any variable)
+    """
+    from statsmodels.stats.outliers_influence import variance_inflation_factor
+    X_df = df_model[ind_vars].dropna().copy()
+    X_const = sm.add_constant(X_df)
+    vif_data = []
+    cols = list(X_const.columns)
+    for i, col in enumerate(cols):
+        if col == 'const':
+            continue
+        try:
+            vif_val = variance_inflation_factor(X_const.values, i)
+        except Exception:
+            vif_val = np.nan
+        if np.isnan(vif_val) or np.isinf(vif_val):
+            level = "Không xác định"
+            color = "#8b949e"
+        elif vif_val < 5:
+            level = "✅ Tốt (< 5)"
+            color = "#3fb950"
+        elif vif_val < 10:
+            level = "⚠️ Trung bình (5–10)"
+            color = "#d29922"
+        else:
+            level = "🚨 Cao (> 10) — Đa cộng tuyến!"
+            color = "#f85149"
+        vif_data.append({"Biến": col, "VIF": round(float(vif_val), 2), "Mức độ": level, "_color": color})
+
+    has_high_vif = any(v["VIF"] > 10 for v in vif_data if not (np.isnan(v["VIF"]) or np.isinf(v["VIF"])))
+
+    # Detect if high VIF is likely due to polynomial (X and X²)
+    poly_collision = False
+    base_vars = set()
+    sq_vars = set()
+    for v in vif_data:
+        name = v["Biến"]
+        if name.endswith("²") or name.endswith("_Sq") or name.endswith("2") or "Xc2" in name or "Cust_Sq" in name:
+            sq_vars.add(name)
+        else:
+            base_vars.add(name)
+    # Check if any base var approximately matches a square var
+    for bv in base_vars:
+        for sv in sq_vars:
+            if bv.lower() in sv.lower() or sv.lower().replace("²","").replace("_sq","").replace("2","").strip() in bv.lower():
+                poly_collision = True
+                break
+
+    return pd.DataFrame(vif_data), has_high_vif, poly_collision
+
+
+def detect_outlier_rows(df):
+    """
+    Detect rows that are likely outliers or aggregate rows.
+    Returns list of dicts: {index, label, reason, severity}
+    - 'TOTAL'/'SUM'/'TONG' aggregate rows -> severity='aggregate'
+    - Statistical outliers via IQR (> 3*IQR) -> severity='extreme'
+    """
+    suspects = []
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+    # --- Aggregate / totals rows: check first text column for keywords ----
+    text_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+    AGG_KEYWORDS = ['total', 'tong', 'tổng', 'sum', 'grand', 'subtotal', 'average', 'mean']
+    for idx, row in df.iterrows():
+        for tc in text_cols:
+            cell = str(row[tc]).strip().lower()
+            if any(kw in cell for kw in AGG_KEYWORDS):
+                suspects.append({
+                    'index': idx,
+                    'label': f"{tc}={row[tc]}",
+                    'reason': f"Dòng tổng hợp ('{row[tc]}') — không phải quan sát thực",
+                    'severity': 'aggregate'
+                })
+                break  # one flag per row is enough
+
+    # --- Statistical extreme outliers: Z-score > 4 in any numeric col ----
+    already_flagged = {s['index'] for s in suspects}
+    for col in numeric_cols:
+        col_data = df[col].dropna()
+        if len(col_data) < 4:
+            continue
+        Q1 = col_data.quantile(0.25)
+        Q3 = col_data.quantile(0.75)
+        IQR = Q3 - Q1
+        if IQR == 0:
+            continue
+        fence = 3.0 * IQR
+        for idx in df.index:
+            if idx in already_flagged:
+                continue
+            val = df.at[idx, col]
+            if pd.notna(val) and (val < Q1 - fence or val > Q3 + fence):
+                # build label from first text column or index
+                label_parts = []
+                for tc in text_cols[:2]:
+                    label_parts.append(f"{tc}={df.at[idx, tc]}")
+                label = ', '.join(label_parts) if label_parts else f"row {idx}"
+                direction = 'cao bất thường' if val > Q3 + fence else 'thấp bất thường'
+                suspects.append({
+                    'index': idx,
+                    'label': label,
+                    'reason': f"{col} = {val:,.0f} — {direction} (ngoài 3×IQR)",
+                    'severity': 'extreme'
+                })
+                already_flagged.add(idx)
+
+    return suspects
+
 
 def detect_header_row(raw_df, max_scan=10):
     """
@@ -406,111 +522,188 @@ def run_regression(df, dep_var, ind_vars, model_type):
 
 
 def make_plots(model, df_clean, dep_var, ind_vars, model_type):
-    """Generate trend + residual + Q-Q plots, return as bytes."""
-    fig = plt.figure(figsize=(16, 12))
-    fig.patch.set_facecolor('#0d1117')
-    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.35)
-
-    DARK = '#0d1117'
-    PANEL = '#161b22'
-    GRID = '#21262d'
-    RED = '#f85149'
-    BLUE = '#58a6ff'
-    GRAY = '#8b949e'
+    """
+    Generate 4 diagnostic plots.
+    Plot 1 (Trend): always 2-D — X axis = most important variable by |t-stat|,
+                    all other vars held at their mean. Prediction done over a
+                    sorted linspace so the line is never zigzag.
+    Plot 2: Residuals vs Fitted
+    Plot 3: Q-Q plot
+    Plot 4: Actual vs Predicted
+    """
+    # ── colour palette ──────────────────────────────────────────────────────
+    DARK  = '#0d1117'
+    PANEL = '#1c2333'
+    GRID  = '#30363d'
+    RED   = '#f85149'
+    BLUE  = '#58a6ff'
+    GRAY  = '#8b949e'
     GREEN = '#3fb950'
+    WHITE = '#e6edf3'
+    CI_COLOR = '#f85149'
 
-    # ── Plot 1: Trend / Scatter with fitted line (first independent var) ──────
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.set_facecolor(PANEL)
-    x_col = ind_vars[0]
-    x_vals = df_clean[x_col]
+    is_log = (model_type == "Logarithmic (Log Y)")
 
-    if model_type == "Logarithmic (Log Y)":
-        y_fitted = np.exp(model.fittedvalues)
-        y_actual = df_clean[dep_var]
+    # ── pick most important X: highest |t-stat| among ind_vars ──────────────
+    t_abs = {}
+    for col in ind_vars:
+        # match partial name (quadratic terms contain the base name)
+        for param_name in model.tvalues.index:
+            if param_name == col or param_name.startswith(col):
+                t_abs[col] = max(t_abs.get(col, 0), abs(model.tvalues[param_name]))
+    if t_abs:
+        key_var = max(t_abs, key=t_abs.get)
     else:
-        y_fitted = model.fittedvalues
-        y_actual = df_clean[dep_var]
+        key_var = ind_vars[0]
 
-    ax1.scatter(x_vals, y_actual, color=GRAY, alpha=0.6, s=30, label='Thực tế')
+    # ── figure layout ────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(16, 11))
+    fig.patch.set_facecolor(DARK)
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.48, wspace=0.38)
 
-    # Smooth prediction line over x range
-    x_range = np.linspace(x_vals.min(), x_vals.max(), 200)
-    df_range = df_clean.copy()
+    def style_ax(ax, title, xlabel, ylabel):
+        ax.set_facecolor(PANEL)
+        ax.set_title(title, color=WHITE, fontsize=11, fontweight='bold', pad=10)
+        ax.set_xlabel(xlabel, color=GRAY, fontsize=9, labelpad=6)
+        ax.set_ylabel(ylabel, color=GRAY, fontsize=9, labelpad=6)
+        ax.tick_params(colors=GRAY, labelsize=8)
+        ax.grid(True, alpha=0.25, color=GRID, linestyle='--')
+        for spine in ax.spines.values():
+            spine.set_color(GRID)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PLOT 1 — Trend: dep_var ~ key_var  (others held at mean)
+    # ════════════════════════════════════════════════════════════════════════
+    ax1 = fig.add_subplot(gs[0, 0])
+
+    x_vals   = df_clean[key_var].values
+    y_actual = df_clean[dep_var].values
+
+    # Scatter: actual data
+    ax1.scatter(x_vals, y_actual, color=GRAY, alpha=0.65, s=40,
+                zorder=3, label='Dữ liệu thực tế', edgecolors='none')
+
+    # Build a SORTED grid of 300 points along key_var, others = mean
+    x_grid = np.linspace(x_vals.min(), x_vals.max(), 300)
     pred_rows = []
-    for xv in x_range:
-        row = {c: df_clean[c].mean() for c in ind_vars}
-        row[x_col] = xv
+    for xv in x_grid:
+        row = {c: float(df_clean[c].mean()) for c in ind_vars}
+        row[key_var] = xv
         pred_rows.append(row)
-    df_pred_range = pd.DataFrame(pred_rows)
-    X_range = build_X(df_pred_range, ind_vars, model_type)
+    df_grid = pd.DataFrame(pred_rows)
+
+    # Build design matrix for the grid
+    X_grid = build_X(df_grid, ind_vars, model_type)
+
+    # Align columns exactly to what the model was trained on
+    try:
+        # model.model.exog_names may include 'const'; X_grid has 'const' from add_constant
+        # Just reindex to match — fill missing with 0 (safe for const already present)
+        target_cols = model.model.exog_names
+        for col in target_cols:
+            if col not in X_grid.columns:
+                X_grid[col] = 0.0
+        X_grid = X_grid[target_cols]
+    except Exception:
+        pass
 
     try:
-        preds = model.get_prediction(X_range)
-        pf = preds.summary_frame(alpha=0.05)
-        y_line = pf['mean'] if model_type != "Logarithmic (Log Y)" else np.exp(pf['mean'])
-        y_lo   = pf['mean_ci_lower'] if model_type != "Logarithmic (Log Y)" else np.exp(pf['mean_ci_lower'])
-        y_hi   = pf['mean_ci_upper'] if model_type != "Logarithmic (Log Y)" else np.exp(pf['mean_ci_upper'])
-        ax1.plot(x_range, y_line, color=RED, lw=2, label='Đường hồi quy')
-        ax1.fill_between(x_range, y_lo, y_hi, color=RED, alpha=0.15, label='95% CI')
-    except Exception:
-        ax1.plot(x_vals, y_fitted, color=RED, lw=2, label='Fitted')
+        preds = model.get_prediction(X_grid)
+        pf    = preds.summary_frame(alpha=0.05)
+        if is_log:
+            y_line = np.exp(pf['mean'].values)
+            y_lo   = np.exp(pf['mean_ci_lower'].values)
+            y_hi   = np.exp(pf['mean_ci_upper'].values)
+        else:
+            y_line = pf['mean'].values
+            y_lo   = pf['mean_ci_lower'].values
+            y_hi   = pf['mean_ci_upper'].values
 
-    ax1.set_title(f'Trend: {dep_var} ~ {x_col}', color='#e6edf3', fontsize=10)
-    ax1.set_xlabel(x_col, color=GRAY, fontsize=9)
-    ax1.set_ylabel(dep_var, color=GRAY, fontsize=9)
-    ax1.tick_params(colors=GRAY)
-    ax1.grid(True, alpha=0.2, color=GRID)
-    ax1.spines[:].set_color(GRID)
-    ax1.legend(fontsize=8, labelcolor='#e6edf3', facecolor=PANEL)
+        ax1.fill_between(x_grid, y_lo, y_hi,
+                         color=CI_COLOR, alpha=0.18, zorder=2, label='95% CI')
+        ax1.plot(x_grid, y_line, color=RED, lw=2.5, zorder=4, label='Đường hồi quy')
+    except Exception as e:
+        # Fallback: scatter fitted vs key_var (sorted)
+        sort_idx = np.argsort(x_vals)
+        y_fit = np.exp(model.fittedvalues.values) if is_log else model.fittedvalues.values
+        ax1.plot(x_vals[sort_idx], y_fit[sort_idx], color=RED, lw=2.5, label='Fitted')
 
-    # ── Plot 2: Residual vs Fitted ─────────────────────────────────────────
+    # Subtitle note for multi-variable models
+    other_vars = [v for v in ind_vars if v != key_var]
+    note = ""
+    if other_vars:
+        means_str = ", ".join([f"{v}={df_clean[v].mean():.2f}" for v in other_vars])
+        note = f"(biến khác giữ ở mean: {means_str})"
+
+    title_main = f"Trend: {dep_var} ~ {key_var}"
+    if len(ind_vars) > 1:
+        title_main += f"  [biến quan trọng nhất]"
+    style_ax(ax1, title_main, key_var, dep_var)
+    if note:
+        ax1.annotate(note, xy=(0.5, -0.14), xycoords='axes fraction',
+                     ha='center', fontsize=7.5, color=GRAY)
+    ax1.legend(fontsize=8.5, labelcolor=WHITE, facecolor=PANEL,
+               edgecolor=GRID, framealpha=0.9)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PLOT 2 — Residuals vs Fitted
+    # ════════════════════════════════════════════════════════════════════════
     ax2 = fig.add_subplot(gs[0, 1])
-    ax2.set_facecolor(PANEL)
-    ax2.scatter(model.fittedvalues, model.resid, color=BLUE, alpha=0.5, s=30)
-    ax2.axhline(0, color=RED, linestyle='--', lw=1.5)
-    ax2.set_title('Residual Plot (Fitted vs Residuals)', color='#e6edf3', fontsize=10)
-    ax2.set_xlabel('Giá trị dự báo (Fitted)', color=GRAY, fontsize=9)
-    ax2.set_ylabel('Phần dư (Residuals)', color=GRAY, fontsize=9)
-    ax2.tick_params(colors=GRAY)
-    ax2.grid(True, alpha=0.2, color=GRID)
-    ax2.spines[:].set_color(GRID)
+    fitted = model.fittedvalues.values
+    resid  = model.resid.values
+    ax2.scatter(fitted, resid, color=BLUE, alpha=0.55, s=40,
+                edgecolors='none', zorder=3)
+    ax2.axhline(0, color=RED, linestyle='--', lw=1.8, zorder=2)
+    # Lowess smoother hint
+    try:
+        from statsmodels.nonparametric.smoothers_lowess import lowess
+        sm_line = lowess(resid, fitted, frac=0.5)
+        ax2.plot(sm_line[:, 0], sm_line[:, 1], color=GREEN,
+                 lw=1.5, linestyle='-', alpha=0.7, label='Lowess')
+        ax2.legend(fontsize=8, labelcolor=WHITE, facecolor=PANEL, edgecolor=GRID)
+    except Exception:
+        pass
+    style_ax(ax2, 'Residual Plot', 'Giá trị dự báo (Fitted)', 'Phần dư (Residuals)')
 
-    # ── Plot 3: Q-Q Plot ───────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # PLOT 3 — Q-Q Plot
+    # ════════════════════════════════════════════════════════════════════════
     ax3 = fig.add_subplot(gs[1, 0])
-    ax3.set_facecolor(PANEL)
-    resid_std = (model.resid - model.resid.mean()) / model.resid.std()
-    (osm, osr), (slope, intercept, r) = stats.probplot(model.resid, dist="norm")
-    ax3.scatter(osm, osr, color=BLUE, alpha=0.6, s=25, label='Phần dư')
-    x_line = np.array([min(osm), max(osm)])
-    ax3.plot(x_line, slope * x_line + intercept, color=RED, lw=2, label='Đường chuẩn')
-    ax3.set_title('Q-Q Plot (Kiểm tra chuẩn hóa phần dư)', color='#e6edf3', fontsize=10)
-    ax3.set_xlabel('Quantile lý thuyết', color=GRAY, fontsize=9)
-    ax3.set_ylabel('Quantile thực tế', color=GRAY, fontsize=9)
-    ax3.tick_params(colors=GRAY)
-    ax3.grid(True, alpha=0.2, color=GRID)
-    ax3.spines[:].set_color(GRID)
-    ax3.legend(fontsize=8, labelcolor='#e6edf3', facecolor=PANEL)
+    (osm, osr), (slope, intercept, _) = stats.probplot(resid, dist="norm")
+    ax3.scatter(osm, osr, color=BLUE, alpha=0.65, s=35, edgecolors='none',
+                zorder=3, label='Phần dư')
+    x_ref = np.array([min(osm), max(osm)])
+    ax3.plot(x_ref, slope * x_ref + intercept, color=RED,
+             lw=2, zorder=4, label='Đường chuẩn')
+    style_ax(ax3, 'Q-Q Plot  (Chuẩn hóa phần dư)',
+             'Quantile lý thuyết', 'Quantile thực tế')
+    ax3.legend(fontsize=8.5, labelcolor=WHITE, facecolor=PANEL, edgecolor=GRID)
 
-    # ── Plot 4: Actual vs Predicted ────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # PLOT 4 — Actual vs Predicted
+    # ════════════════════════════════════════════════════════════════════════
     ax4 = fig.add_subplot(gs[1, 1])
-    ax4.set_facecolor(PANEL)
-    y_pred_plot = np.exp(model.fittedvalues) if model_type == "Logarithmic (Log Y)" else model.fittedvalues
-    y_act_plot  = df_clean[dep_var]
-    ax4.scatter(y_act_plot, y_pred_plot, color=GREEN, alpha=0.5, s=30)
-    mn = min(y_act_plot.min(), y_pred_plot.min())
-    mx = max(y_act_plot.max(), y_pred_plot.max())
-    ax4.plot([mn, mx], [mn, mx], color=RED, lw=1.5, linestyle='--', label='Perfect fit')
-    ax4.set_title('Actual vs Predicted', color='#e6edf3', fontsize=10)
-    ax4.set_xlabel('Giá trị thực tế', color=GRAY, fontsize=9)
-    ax4.set_ylabel('Giá trị dự báo', color=GRAY, fontsize=9)
-    ax4.tick_params(colors=GRAY)
-    ax4.grid(True, alpha=0.2, color=GRID)
-    ax4.spines[:].set_color(GRID)
-    ax4.legend(fontsize=8, labelcolor='#e6edf3', facecolor=PANEL)
+    y_pred_p = np.exp(model.fittedvalues.values) if is_log else model.fittedvalues.values
+    y_act_p  = df_clean[dep_var].values
+    ax4.scatter(y_act_p, y_pred_p, color=GREEN, alpha=0.55, s=40,
+                edgecolors='none', zorder=3)
+    mn = min(y_act_p.min(), y_pred_p.min())
+    mx = max(y_act_p.max(), y_pred_p.max())
+    ax4.plot([mn, mx], [mn, mx], color=RED, lw=1.8, linestyle='--',
+             zorder=4, label='Perfect fit (y=x)')
+    style_ax(ax4, 'Actual vs Predicted', 'Giá trị thực tế', 'Giá trị dự báo')
+    ax4.legend(fontsize=8.5, labelcolor=WHITE, facecolor=PANEL, edgecolor=GRID)
+
+    # ── overall title ────────────────────────────────────────────────────────
+    n_vars_label = f"{len(ind_vars)} biến: {', '.join(ind_vars)}" if len(ind_vars) > 1 else ind_vars[0]
+    fig.suptitle(
+        f"{dep_var}  ←  {n_vars_label}   [{model_type}]   "
+        f"R²={model.rsquared:.3f}  Adj R²={model.rsquared_adj:.3f}",
+        color=WHITE, fontsize=11, fontweight='bold', y=1.01
+    )
 
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=130, bbox_inches='tight', facecolor=DARK)
+    plt.savefig(buf, format='png', dpi=140, bbox_inches='tight', facecolor=DARK)
     plt.close()
     buf.seek(0)
     return buf
@@ -581,19 +774,42 @@ def export_to_excel(run_history):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
         wb = writer.book
-        hdr_fmt = wb.add_format({'bold': True, 'bg_color': '#1f3a5f', 'font_color': '#58a6ff', 'border': 1})
-        num_fmt = wb.add_format({'num_format': '#,##0.0000', 'border': 1})
-        cell_fmt = wb.add_format({'border': 1, 'font_color': '#e6edf3'})
 
-        # Summary sheet
+        # ── Formats ──────────────────────────────────────────────────────────
+        sum_hdr_fmt = wb.add_format({
+            'bold': True, 'bg_color': '#1f3a5f', 'font_color': '#58a6ff',
+            'border': 1, 'font_name': 'Arial', 'align': 'center'
+        })
+        sum_int_fmt = wb.add_format({'num_format': '0', 'border': 1, 'font_name': 'Arial'})
+        sum_num_fmt = wb.add_format({'num_format': '#,##0.0000', 'border': 1, 'font_name': 'Arial'})
+        sum_txt_fmt = wb.add_format({'border': 1, 'font_name': 'Arial'})
+
+        run_section_hdr_fmt = wb.add_format({
+            'bold': True, 'bg_color': '#1f3a5f', 'font_color': '#FFFFFF',
+            'border': 1, 'font_name': 'Arial', 'align': 'center'
+        })
+        run_col_hdr_fmt = wb.add_format({
+            'bold': True, 'bg_color': '#BDD7EE', 'font_color': '#000000',
+            'border': 1, 'font_name': 'Arial', 'align': 'center'
+        })
+        run_num_fmt    = wb.add_format({'num_format': '#,##0.0000', 'border': 1, 'font_name': 'Arial', 'font_color': '#000000'})
+        run_int_fmt    = wb.add_format({'num_format': '0',          'border': 1, 'font_name': 'Arial', 'font_color': '#000000'})
+        run_txt_fmt    = wb.add_format({'border': 1, 'font_name': 'Arial', 'font_color': '#000000'})
+        interp_hdr_fmt = wb.add_format({
+            'bold': True, 'bg_color': '#1f3a5f', 'font_color': '#FFFFFF',
+            'border': 1, 'font_name': 'Arial'
+        })
+        interp_txt_fmt = wb.add_format({'font_name': 'Arial', 'font_color': '#000000', 'text_wrap': True})
+
+        # ── Summary sheet ────────────────────────────────────────────────────
         summary_rows = []
         for r in run_history:
             summary_rows.append({
-                'Run #': r['run_id'],
+                'Run #': int(r['run_id']),
                 'Biến phụ thuộc': r['dep_var'],
                 'Biến độc lập': ', '.join(r['ind_vars']),
                 'Loại mô hình': r['model_type'],
-                'N': r['n'],
+                'N': int(r['n']),
                 'R²': r['r2'],
                 'Adj R²': r['adj_r2'],
                 'RMSE': r['rmse'],
@@ -601,34 +817,67 @@ def export_to_excel(run_history):
                 'F p-value': r['f_pvalue'],
             })
         sum_df = pd.DataFrame(summary_rows)
-        sum_df.to_excel(writer, sheet_name='Summary', index=False)
-        ws_sum = writer.sheets['Summary']
-        for col_num, val in enumerate(sum_df.columns):
-            ws_sum.write(0, col_num, val, hdr_fmt)
-        ws_sum.set_column('A:J', 18, num_fmt)
+        ws_sum = wb.add_worksheet('Summary')
+        writer.sheets['Summary'] = ws_sum
 
-        # Individual run sheets
+        col_widths = [8, 20, 30, 22, 8, 12, 12, 12, 12, 14]
+        int_sum_cols = {'Run #', 'N'}
+        for ci, (col, w) in enumerate(zip(sum_df.columns, col_widths)):
+            ws_sum.write(0, ci, col, sum_hdr_fmt)
+            ws_sum.set_column(ci, ci, w)
+        for ri, row_data in enumerate(summary_rows):
+            for ci, col in enumerate(sum_df.columns):
+                val = row_data[col]
+                if col in int_sum_cols:
+                    ws_sum.write(ri + 1, ci, int(val), sum_int_fmt)
+                elif isinstance(val, float):
+                    ws_sum.write(ri + 1, ci, val, sum_num_fmt)
+                else:
+                    ws_sum.write(ri + 1, ci, val, sum_txt_fmt)
+
+        # ── Individual run sheets ────────────────────────────────────────────
+        def write_table(ws, start_row, title, df_table, int_col_names=None):
+            n_cols = len(df_table.columns)
+            int_col_names = int_col_names or set()
+            ws.merge_range(start_row, 0, start_row, max(n_cols - 1, 0), title, run_section_hdr_fmt)
+            start_row += 1
+            for ci, col in enumerate(df_table.columns):
+                ws.write(start_row, ci, str(col), run_col_hdr_fmt)
+            start_row += 1
+            for ri, row_vals in enumerate(df_table.itertuples(index=False)):
+                for ci, val in enumerate(row_vals):
+                    col_name = df_table.columns[ci]
+                    is_nan = isinstance(val, float) and np.isnan(val)
+                    if col_name in int_col_names and isinstance(val, (int, float, np.integer, np.floating)) and not is_nan:
+                        ws.write(start_row + ri, ci, int(val), run_int_fmt)
+                    elif isinstance(val, (int, float, np.integer, np.floating)) and not is_nan:
+                        ws.write(start_row + ri, ci, float(val), run_num_fmt)
+                    elif val is None or is_nan:
+                        ws.write_blank(start_row + ri, ci, None, run_txt_fmt)
+                    else:
+                        ws.write(start_row + ri, ci, str(val), run_txt_fmt)
+            return start_row + len(df_table) + 2
+
         for r in run_history:
-            sheet_name = f"Run{r['run_id']}_{r['model_type'][:12].replace(' ','_')}"[:31]
-            row = 0
+            sname = f"Run{r['run_id']}"
+            ws = wb.add_worksheet(sname)
+            writer.sheets[sname] = ws
+            for ci in range(8):
+                ws.set_column(ci, ci, 22)
 
             rs_df, an_df, cf_df = r['tables']
-            rs_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=row)
-            row += len(rs_df) + 2
+            row = 0
+            row = write_table(ws, row,
+                f"RUN {r['run_id']}  ·  {r['dep_var']} ~ {', '.join(r['ind_vars'])}  [{r['model_type']}]",
+                rs_df)
+            row = write_table(ws, row, "BẢNG ANOVA", an_df, int_col_names={'df'})
+            row = write_table(ws, row, "HỆ SỐ HỒI QUY (COEFFICIENTS)", cf_df)
 
-            an_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=row)
-            row += len(an_df) + 2
-
-            cf_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=row)
-
-            ws = writer.sheets[sheet_name]
-            ws.set_column('B:H', 18, num_fmt)
-
-            # Interpretation
-            row2 = row + len(cf_df) + 3
-            ws.write(row2, 0, 'DIỄN GIẢI', hdr_fmt)
+            ws.write(row, 0, 'DIỄN GIẢI KẾT QUẢ', interp_hdr_fmt)
+            row += 1
             for i, line in enumerate(r['interpretation'].split('\n')):
-                ws.write(row2 + 1 + i, 0, line, cell_fmt)
+                ws.write(row + i, 0, line, interp_txt_fmt)
+                ws.set_row(row + i, 15)
 
     buf.seek(0)
     return buf
@@ -638,8 +887,55 @@ def export_to_excel(run_history):
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown('<div class="hero-title">📈 Regression<br>Analyst</div>', unsafe_allow_html=True)
-    st.markdown('<div class="hero-sub">Phân tích hồi quy tuyến tính & phi tuyến</div>', unsafe_allow_html=True)
+    # ── Logo ─────────────────────────────────────────────────────────────────
+    st.markdown("""
+    <div style="display:flex;align-items:center;gap:14px;padding:10px 0 6px 0;">
+      <div>
+        <svg width="52" height="52" viewBox="0 0 52 52" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="bg_grad" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" style="stop-color:#1f3a5f;stop-opacity:1"/>
+              <stop offset="100%" style="stop-color:#2d1f5f;stop-opacity:1"/>
+            </linearGradient>
+            <linearGradient id="line_grad" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" style="stop-color:#58a6ff"/>
+              <stop offset="50%" style="stop-color:#bc8cff"/>
+              <stop offset="100%" style="stop-color:#f778ba"/>
+            </linearGradient>
+          </defs>
+          <!-- Background rounded square -->
+          <rect width="52" height="52" rx="13" fill="url(#bg_grad)"/>
+          <!-- Grid lines subtle -->
+          <line x1="12" y1="40" x2="44" y2="40" stroke="#30363d" stroke-width="0.8"/>
+          <line x1="12" y1="30" x2="44" y2="30" stroke="#30363d" stroke-width="0.8"/>
+          <line x1="12" y1="20" x2="44" y2="20" stroke="#30363d" stroke-width="0.8"/>
+          <line x1="12" y1="40" x2="12" y2="12" stroke="#30363d" stroke-width="0.8"/>
+          <!-- Regression line gradient -->
+          <line x1="13" y1="38" x2="43" y2="14" stroke="url(#line_grad)" stroke-width="2.5" stroke-linecap="round"/>
+          <!-- Scatter dots -->
+          <circle cx="16" cy="36" r="2.8" fill="#58a6ff" opacity="0.9"/>
+          <circle cx="22" cy="32" r="2.8" fill="#70b8ff" opacity="0.9"/>
+          <circle cx="27" cy="27" r="2.8" fill="#9d7aef" opacity="0.9"/>
+          <circle cx="33" cy="23" r="2.8" fill="#bc8cff" opacity="0.9"/>
+          <circle cx="39" cy="17" r="2.8" fill="#f778ba" opacity="0.9"/>
+          <!-- Residual tick lines -->
+          <line x1="22" y1="31" x2="22" y2="28.5" stroke="#58a6ff" stroke-width="1.2" opacity="0.6"/>
+          <line x1="33" y1="23" x2="33" y2="25.5" stroke="#f778ba" stroke-width="1.2" opacity="0.6"/>
+          <!-- Small R² badge -->
+          <rect x="34" y="5" width="14" height="9" rx="3" fill="#3fb950" opacity="0.85"/>
+          <text x="41" y="12.5" text-anchor="middle" font-family="monospace" font-size="6.5" font-weight="bold" fill="white">R²</text>
+        </svg>
+      </div>
+      <div>
+        <div style="font-family:'Space Mono',monospace;font-size:1.15rem;font-weight:700;
+             background:linear-gradient(90deg,#58a6ff,#bc8cff,#f778ba);
+             -webkit-background-clip:text;-webkit-text-fill-color:transparent;line-height:1.25;">
+          Regression<br>Analyst
+        </div>
+        <div style="color:#8b949e;font-size:0.72rem;margin-top:2px;">OLS · Đa biến · Phi tuyến</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
     st.divider()
 
     uploaded = st.file_uploader("Upload dữ liệu (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"])
@@ -649,6 +945,9 @@ with st.sidebar:
             df_loaded, hdr_row = load_data(uploaded)
             if df_loaded is not None:
                 st.session_state["df"] = df_loaded
+                st.session_state["outlier_checked"] = False
+                st.session_state["outlier_rows"] = []
+                st.session_state["excluded_rows"] = set()
                 st.session_state["filename"] = uploaded.name
                 st.session_state["header_row"] = hdr_row
                 st.success(f"✅ Đã tải: {uploaded.name}")
@@ -667,8 +966,60 @@ with st.sidebar:
         if st.session_state["run_history"]:
             st.caption(f"🔢 {len(st.session_state['run_history'])} lần chạy đã lưu")
 
+    # ── Model type guide ──────────────────────────────────────────────────────
     st.divider()
-    st.markdown('<div style="color:#8b949e;font-size:0.75rem;">Powered by statsmodels · OLS</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-family:monospace;font-size:0.65rem;text-transform:uppercase;letter-spacing:1.5px;color:#58a6ff;margin-bottom:6px;">📘 Khi nào dùng mô hình nào?</div>', unsafe_allow_html=True)
+
+    with st.expander("📐 Bậc hai Centered — khi nào?", expanded=False):
+        st.markdown("""
+<div style="font-size:0.82rem;color:#e6edf3;line-height:1.7;">
+<b style="color:#58a6ff;">✔ Dùng khi:</b><br>
+• Biểu đồ Residual có dạng cong (U-shape hoặc ∩)<br>
+• Quan hệ Y~X phi tuyến, cần thêm X²<br>
+• Đã thêm X² nhưng hệ số X trở nên không có ý nghĩa (p lớn)<br><br>
+
+<b style="color:#f85149;">⚠ Vấn đề khi dùng Bậc 2 thường:</b><br>
+Khi X và X² cùng xuất hiện, chúng thường <b>tương quan rất cao</b> (r ≈ 0.95–0.99) → <b>đa cộng tuyến</b> làm Std Error phồng to, hệ số không ổn định.<br><br>
+
+<b style="color:#3fb950;">✅ Giải pháp — Centering:</b><br>
+Xc = X − mean(X)<br>
+Xc² = Xc²<br>
+→ Loại bỏ tương quan giữa Xc và Xc², hệ số ổn định hơn, <b>R² không đổi</b>.
+</div>""", unsafe_allow_html=True)
+
+    with st.expander("📈 Logarithmic — khi nào?", expanded=False):
+        st.markdown("""
+<div style="font-size:0.82rem;color:#e6edf3;line-height:1.7;">
+<b style="color:#58a6ff;">✔ Dùng khi:</b><br>
+• Y tăng theo cấp số nhân (doanh thu, giá, lượt truy cập)<br>
+• Phần dư có phương sai tăng dần theo X (heteroscedasticity)<br>
+• Biểu đồ Actual vs Predicted bị lệch mạnh với giá trị lớn<br><br>
+
+<b style="color:#d29922;">📌 Lưu ý:</b><br>
+• Mô hình: <b>ln(Y) = a + bX</b><br>
+• Hệ số b nghĩa là: X tăng 1 đơn vị → Y thay đổi <b>e^b lần</b><br>
+• Yêu cầu <b>Y > 0</b> tuyệt đối (không có giá trị âm hoặc 0)
+</div>""", unsafe_allow_html=True)
+
+    with st.expander("🔗 Tương tác (Interaction) — khi nào?", expanded=False):
+        st.markdown("""
+<div style="font-size:0.82rem;color:#e6edf3;line-height:1.7;">
+<b style="color:#58a6ff;">✔ Dùng khi:</b><br>
+• Ảnh hưởng của X₁ lên Y <b>phụ thuộc vào mức độ của X₂</b><br>
+• Ví dụ: hiệu quả quảng cáo khác nhau theo mùa vụ<br>
+• Đã thử mô hình tuyến tính nhưng Q-Q Plot và Residual còn pattern<br><br>
+
+<b style="color:#d29922;">📌 Cách diễn giải:</b><br>
+Thêm biến X₁×X₂ vào mô hình:<br>
+Y = a + b₁X₁ + b₂X₂ + b₃(X₁×X₂)<br>
+Hệ số b₃: cho thấy X₁ tăng 1 đơn vị thì <b>hệ số dốc của X₂ thay đổi b₃ đơn vị</b>.<br><br>
+
+<b style="color:#f85149;">⚠ Rủi ro:</b><br>
+Dễ gây đa cộng tuyến nếu X₁ và X₂ tương quan cao với nhau.
+</div>""", unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown('<div style="color:#8b949e;font-size:0.72rem;">Powered by statsmodels · OLS</div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -823,12 +1174,75 @@ st.markdown(f'<div class="info-box">ℹ️ <b>{model_type}</b>: {MODEL_INFO[mode
 
 st.divider()
 
-# ── Section 3: Run Model ────────────────────────────────────────────────────
-st.markdown('<div class="section-hdr">③ CHẠY MÔ HÌNH</div>', unsafe_allow_html=True)
+# ── Section 3: Outlier Warning & Run Model ──────────────────────────────────
+st.markdown('<div class="section-hdr">③ CẢNH BÁO OUTLIER & CHẠY MÔ HÌNH</div>', unsafe_allow_html=True)
+
+# ── Outlier detection (runs once per loaded dataframe) ─────────────────────
+df_id = id(df)
+if not st.session_state.get("outlier_checked") or st.session_state.get("_df_id") != df_id:
+    st.session_state["outlier_rows"] = detect_outlier_rows(df)
+    st.session_state["excluded_rows"] = set()
+    st.session_state["outlier_checked"] = True
+    st.session_state["_df_id"] = df_id
+
+outlier_rows = st.session_state["outlier_rows"]
+excluded_rows = st.session_state["excluded_rows"]
+
+if outlier_rows:
+    st.markdown('<div class="warn-box">⚠️ <b>Phát hiện dữ liệu bất thường!</b> App đã tìm thấy các dòng dưới đây có thể ảnh hưởng đến kết quả hồi quy. Vui lòng xem xét và chọn có loại bỏ hay không trước khi chạy.</div>', unsafe_allow_html=True)
+
+    with st.expander("🔍 Chi tiết dòng bất thường — click để xem và chọn", expanded=True):
+        st.markdown("**Đánh dấu ✗ để loại dòng, để trống để giữ lại:**")
+        new_excluded = set()
+        for item in outlier_rows:
+            idx = item["index"]
+            severity_icon = "🚫" if item["severity"] == "aggregate" else "⚠️"
+            label_text = f"{severity_icon} **Dòng {idx}** — {item['label']}  |  {item['reason']}"
+            checked = st.checkbox(label_text, value=(idx in excluded_rows), key=f"excl_{idx}")
+            if checked:
+                new_excluded.add(idx)
+        st.session_state["excluded_rows"] = new_excluded
+        excluded_rows = new_excluded
+
+    if excluded_rows:
+        st.markdown(
+            f'<div class="info-box">ℹ️ Đã chọn loại <b>{len(excluded_rows)}</b> dòng: index {sorted(excluded_rows)}. ' +
+            'App sẽ chạy <b>2 lần</b>: một lần có đầy đủ dữ liệu và một lần đã loại, để so sánh.</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown('<div class="info-box">ℹ️ Chưa chọn loại dòng nào — sẽ chạy với toàn bộ dữ liệu.</div>', unsafe_allow_html=True)
+else:
+    st.markdown('<div class="ok-box">✅ Không phát hiện dòng tổng hợp hay outlier cực đoan trong dữ liệu.</div>', unsafe_allow_html=True)
 
 run_col, _ = st.columns([1, 3])
 with run_col:
     run_clicked = st.button("▶ Chạy Hồi Quy", type="primary", use_container_width=True)
+
+def _do_one_run(df_run, dep_var, ind_vars, model_type, label_suffix=""):
+    """Run one regression and return a result dict, or raise."""
+    model, df_clean, y = run_regression(df_run, dep_var, ind_vars, model_type)
+    rs_df, an_df, cf_df = get_ols_stats(model)
+    interp = interpret_model(model, model_type, dep_var, ind_vars)
+    plot_buf = make_plots(model, df_clean, dep_var, ind_vars, model_type)
+    st.session_state["run_counter"] += 1
+    run_id = st.session_state["run_counter"]
+    return {
+        "run_id": run_id,
+        "dep_var": dep_var,
+        "ind_vars": ind_vars.copy(),
+        "model_type": model_type,
+        "n": int(model.nobs),
+        "r2": round(model.rsquared, 4),
+        "adj_r2": round(model.rsquared_adj, 4),
+        "rmse": round(float(np.sqrt(model.mse_resid)), 4),
+        "fstat": round(model.fvalue, 4),
+        "f_pvalue": round(model.f_pvalue, 6),
+        "tables": (rs_df, an_df, cf_df),
+        "interpretation": interp,
+        "plot_buf": plot_buf,
+        "label_suffix": label_suffix,
+    }
 
 if run_clicked:
     if not ind_vars:
@@ -836,32 +1250,30 @@ if run_clicked:
     else:
         with st.spinner("Đang chạy mô hình..."):
             try:
-                model, df_clean, y = run_regression(df, dep_var, ind_vars, model_type)
-                rs_df, an_df, cf_df = get_ols_stats(model)
-                interp = interpret_model(model, model_type, dep_var, ind_vars)
-                plot_buf = make_plots(model, df_clean, dep_var, ind_vars, model_type)
+                # Always run with full data first
+                result_full = _do_one_run(df, dep_var, ind_vars, model_type, " [Đầy đủ]")
+                st.session_state["run_history"].append(result_full)
+                st.success(f"✅ Run #{result_full['run_id']} (đầy đủ dữ liệu) — R² = {result_full['r2']:.4f}")
 
-                st.session_state["run_counter"] += 1
-                run_id = st.session_state["run_counter"]
+                # If user excluded rows, also run without them
+                if excluded_rows:
+                    df_filtered = df.drop(index=list(excluded_rows)).reset_index(drop=True)
+                    result_excl = _do_one_run(df_filtered, dep_var, ind_vars, model_type, " [Đã loại outlier]")
+                    st.session_state["run_history"].append(result_excl)
+                    st.success(f"✅ Run #{result_excl['run_id']} (đã loại {len(excluded_rows)} dòng) — R² = {result_excl['r2']:.4f}")
 
-                run_result = {
-                    "run_id": run_id,
-                    "dep_var": dep_var,
-                    "ind_vars": ind_vars.copy(),
-                    "model_type": model_type,
-                    "n": int(model.nobs),
-                    "r2": round(model.rsquared, 4),
-                    "adj_r2": round(model.rsquared_adj, 4),
-                    "rmse": round(float(np.sqrt(model.mse_resid)), 4),
-                    "fstat": round(model.fvalue, 4),
-                    "f_pvalue": round(model.f_pvalue, 6),
-                    "tables": (rs_df, an_df, cf_df),
-                    "interpretation": interp,
-                    "plot_buf": plot_buf,
-                }
-                st.session_state["run_history"].append(run_result)
-                st.success(f"✅ Run #{run_id} hoàn thành — R² = {model.rsquared:.4f}")
-
+                    # Quick comparison callout
+                    delta_r2 = result_excl["r2"] - result_full["r2"]
+                    delta_rmse = result_excl["rmse"] - result_full["rmse"]
+                    arrow_r2   = "↑" if delta_r2 > 0 else "↓"
+                    arrow_rmse = "↓" if delta_rmse < 0 else "↑"
+                    box_cls = "ok-box" if delta_r2 > 0 else "warn-box"
+                    st.markdown(
+                        f'<div class="{box_cls}">📊 <b>So sánh nhanh sau khi loại outlier:</b> ' +
+                        f'R² {arrow_r2} {abs(delta_r2):.4f} (đầy đủ: {result_full["r2"]:.4f} → loại: {result_excl["r2"]:.4f}) | ' +
+                        f'RMSE {arrow_rmse} {abs(delta_rmse):.4f} (đầy đủ: {result_full["rmse"]:.4f} → loại: {result_excl["rmse"]:.4f})</div>',
+                        unsafe_allow_html=True
+                    )
             except Exception as e:
                 st.error(f"Lỗi khi chạy mô hình: {e}")
 
@@ -870,7 +1282,8 @@ if run_clicked:
 if st.session_state["run_history"]:
     latest = st.session_state["run_history"][-1]
 
-    st.markdown(f'<div class="section-hdr">④ KẾT QUẢ MÔ HÌNH — Run #{latest["run_id"]}: {latest["dep_var"]} ~ {" + ".join(latest["ind_vars"])} [{latest["model_type"]}]</div>', unsafe_allow_html=True)
+    suffix = latest.get("label_suffix", "")
+    st.markdown(f'<div class="section-hdr">④ KẾT QUẢ MÔ HÌNH — Run #{latest["run_id"]}{suffix}: {latest["dep_var"]} ~ {" + ".join(latest["ind_vars"])} [{latest["model_type"]}]</div>', unsafe_allow_html=True)
 
     # Metrics row
     mc1, mc2, mc3, mc4, mc5 = st.columns(5)
@@ -889,6 +1302,54 @@ if st.session_state["run_history"]:
         st.dataframe(an_df, use_container_width=True, hide_index=True)
     with tab3:
         st.dataframe(cf_df, use_container_width=True, hide_index=True)
+
+    # ── VIF / Multicollinearity check ────────────────────────────────────────
+    if len(latest["ind_vars"]) >= 2:
+        try:
+            df_for_vif = df[[latest["dep_var"]] + latest["ind_vars"]].dropna().copy()
+            # For Quadratic / Centered models, rebuild original numeric vars
+            if latest["model_type"] in ["Bậc hai (Quadratic)", "Bậc hai Centered", "Tương tác (Interaction)"]:
+                # Use the raw ind_vars that were passed in (before squaring)
+                vif_df, has_high_vif, poly_col = compute_vif(df, latest["ind_vars"])
+            else:
+                vif_df, has_high_vif, poly_col = compute_vif(df, latest["ind_vars"])
+
+            st.markdown("**🔬 Kiểm tra đa cộng tuyến (VIF)**")
+            vif_cols = st.columns(len(vif_df))
+            for i, row_v in vif_df.iterrows():
+                color = row_v["_color"]
+                vif_cols[i % len(vif_cols)].markdown(
+                    f'''<div style="background:#1c2333;border:1px solid {color};border-radius:8px;
+                    padding:8px 12px;text-align:center;margin-bottom:4px;">
+                    <div style="color:#8b949e;font-size:0.75rem;">{row_v["Biến"]}</div>
+                    <div style="color:{color};font-size:1.3rem;font-weight:700;">{row_v["VIF"]}</div>
+                    <div style="color:{color};font-size:0.7rem;">{row_v["Mức độ"]}</div>
+                    </div>''', unsafe_allow_html=True
+                )
+
+            if has_high_vif:
+                is_quad_model = latest["model_type"] in ["Bậc hai (Quadratic)"]
+                if poly_col or is_quad_model:
+                    st.markdown('''<div class="err-box">
+🚨 <b>Đa cộng tuyến cao — nguyên nhân có thể do mô hình bậc 2 (X và X²)!</b><br><br>
+<b>Giải thích:</b> Khi thêm biến X² vào mô hình, X và X² thường tương quan rất cao (r ≈ 0.95–0.99) 
+làm <b>VIF tăng vọt</b>, Std Error phồng to, và hệ số X mất ý nghĩa thống kê — dù R² vẫn cao.<br><br>
+<b>✅ Giải pháp được khuyến nghị — Centering:</b><br>
+① Tính biến mới: <code>Xc = X − mean(X)</code> và <code>Xc² = Xc²</code><br>
+② Dùng <b>Xc</b> và <b>Xc²</b> thay cho X và X² trong mô hình<br>
+③ Chọn mô hình <b>"Bậc hai Centered"</b> trong phần Cấu hình → R² giống hệt nhưng VIF giảm mạnh<br><br>
+<b>Lưu ý:</b> Centering không thay đổi khả năng dự báo, chỉ làm hệ số ổn định và dễ diễn giải hơn.
+</div>''', unsafe_allow_html=True)
+                else:
+                    st.markdown('''<div class="warn-box">
+⚠️ <b>Đa cộng tuyến cao giữa các biến độc lập!</b><br>
+VIF > 10 cho thấy các biến X có tương quan cao với nhau, làm hệ số hồi quy không ổn định.<br>
+<b>Khuyến nghị:</b> (1) Loại bỏ biến ít có ý nghĩa nhất, (2) dùng Ridge Regression, hoặc (3) kiểm tra lại cách đặc tả mô hình.
+</div>''', unsafe_allow_html=True)
+            elif len(vif_df) > 0:
+                st.markdown('<div class="ok-box">✅ VIF của tất cả biến đều trong ngưỡng an toàn (< 5) — không có đa cộng tuyến đáng lo.</div>', unsafe_allow_html=True)
+        except Exception as vif_err:
+            st.caption(f"(Không tính được VIF: {vif_err})")
 
     # Charts
     st.markdown("**📈 Biểu đồ phân tích**")
@@ -911,6 +1372,7 @@ if len(st.session_state["run_history"]) > 0:
     for r in history:
         compare_rows.append({
             "Run #": r["run_id"],
+            "Ghi chú": r.get("label_suffix", "").strip(" []"),
             "Y": r["dep_var"],
             "X (biến độc lập)": ", ".join(r["ind_vars"]),
             "Mô hình": r["model_type"],
