@@ -94,6 +94,7 @@ div[data-testid="stExpander"] { background:#161b22; border:1px solid #30363d; bo
 DEFAULTS = {
     "df": None,
     "filename": "",
+    "header_row": 0,
     "run_history": [],      # list of result dicts per run
     "run_counter": 0,
 }
@@ -103,25 +104,176 @@ for k, v in DEFAULTS.items():
 
 # ── Helper utilities ───────────────────────────────────────────────────────
 
+def detect_header_row(raw_df, max_scan=10):
+    """
+    Scan the first `max_scan` rows to find the true header row.
+    The header row is the first row where:
+      - Most cells are non-empty strings (not numbers, not NaN)
+      - The row below contains predominantly numeric values
+    Returns the header row index (0-based).
+    """
+    n_cols = raw_df.shape[1]
+    scan = min(max_scan, raw_df.shape[0] - 1)
+
+    for i in range(scan):
+        row = raw_df.iloc[i]
+        # Count cells that look like text labels (not numeric, not null)
+        text_count = sum(
+            1 for v in row
+            if v is not None
+            and not (isinstance(v, float) and np.isnan(v))
+            and not isinstance(v, (int, float, np.integer, np.floating))
+        )
+        text_ratio = text_count / n_cols if n_cols > 0 else 0
+
+        # Check that the NEXT row is mostly numeric
+        if i + 1 < raw_df.shape[0]:
+            next_row = raw_df.iloc[i + 1]
+            num_count = sum(1 for v in next_row if isinstance(v, (int, float, np.integer, np.floating))
+                            and not (isinstance(v, float) and np.isnan(v)))
+            num_ratio = num_count / n_cols if n_cols > 0 else 0
+        else:
+            num_ratio = 0
+
+        if text_ratio >= 0.5 and num_ratio >= 0.4:
+            return i
+
+    return 0   # fallback: row 0 is the header
+
+
 def load_data(uploaded_file):
+    """Load CSV or Excel, auto-detecting the true header row."""
     name = uploaded_file.name.lower()
+    header_row = 0
+    detected_msg = None
+
     if name.endswith(".csv"):
+        # Read raw first to detect header
+        uploaded_file.seek(0)
         try:
-            df = pd.read_csv(uploaded_file)
+            raw = pd.read_csv(uploaded_file, header=None, nrows=15)
         except Exception:
-            df = pd.read_csv(uploaded_file, encoding='latin1')
+            uploaded_file.seek(0)
+            raw = pd.read_csv(uploaded_file, header=None, nrows=15, encoding='latin1')
+        header_row = detect_header_row(raw)
+        uploaded_file.seek(0)
+        try:
+            df = pd.read_csv(uploaded_file, header=header_row)
+        except Exception:
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, header=header_row, encoding='latin1')
+
     elif name.endswith((".xlsx", ".xls")):
+        uploaded_file.seek(0)
         xf = pd.ExcelFile(uploaded_file)
         sheet_names = xf.sheet_names
         if len(sheet_names) > 1:
             chosen = st.sidebar.selectbox("Sheet name", sheet_names)
         else:
             chosen = sheet_names[0]
-        df = pd.read_excel(uploaded_file, sheet_name=chosen)
+        # Read raw (no header) to detect
+        uploaded_file.seek(0)
+        raw = pd.read_excel(uploaded_file, sheet_name=chosen, header=None, nrows=15)
+        header_row = detect_header_row(raw)
+        uploaded_file.seek(0)
+        df = pd.read_excel(uploaded_file, sheet_name=chosen, header=header_row)
     else:
         st.error("Unsupported file type.")
-        return None
-    return df
+        return None, 0
+
+    # Drop rows that are entirely NaN (often trailing empty rows in Excel)
+    df = df.dropna(how='all').reset_index(drop=True)
+
+    # Strip whitespace from column names
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Coerce columns that look numeric but were read as object
+    for col in df.columns:
+        if df[col].dtype == object:
+            converted = pd.to_numeric(df[col], errors='coerce')
+            if converted.notna().sum() / max(len(df), 1) > 0.7:
+                df[col] = converted
+
+    return df, header_row
+
+
+def suggest_variables(df):
+    """
+    Heuristically suggest which column is the dependent variable (Y)
+    and which are independent variables (X).
+
+    Rules:
+    - Y candidates: numeric columns whose name contains output-like keywords
+      (price, cost, revenue, sales, profit, expense, score, output, result,
+       doanh, chi, gia, ket, thu, buchanan, votes_for)
+      OR the numeric column with the highest variance relative to mean (CV).
+      Tie-break: last numeric column (common in textbook datasets).
+    - X candidates: all other numeric columns.
+    - Text/ID columns (high cardinality strings, index-like) are flagged separately.
+    """
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not numeric_cols:
+        return None, [], [], "Không tìm thấy cột số nào."
+
+    # Keywords that suggest an outcome/dependent variable
+    Y_KEYWORDS = [
+        "price", "cost", "revenue", "sales", "profit", "expense", "score",
+        "output", "result", "income", "wage", "salary", "return", "loss",
+        "target", "label", "y", "dependent", "outcome", "response",
+        # Vietnamese
+        "gia", "chi", "phi", "thu", "doanh", "ket", "qua", "luong",
+        # Case-specific
+        "buchanan", "vote", "expense", "carats",
+    ]
+
+    best_y = None
+    best_score = -1
+    reasons = {}
+
+    for col in numeric_cols:
+        col_lower = col.lower()
+        score = 0
+        reason_parts = []
+
+        # Keyword match
+        kw_matches = [kw for kw in Y_KEYWORDS if kw in col_lower]
+        if kw_matches:
+            score += 3
+            reason_parts.append(f"tên gợi ý biến kết quả ({', '.join(kw_matches)})")
+
+        # High CV (coefficient of variation) → likely outcome with wide range
+        col_data = df[col].dropna()
+        if col_data.mean() != 0:
+            cv = col_data.std() / abs(col_data.mean())
+            if cv > 1.5:
+                score += 1
+                reason_parts.append(f"hệ số biến thiên cao (CV={cv:.2f})")
+
+        # Last column heuristic (common in structured datasets)
+        if col == numeric_cols[-1]:
+            score += 0.5
+            reason_parts.append("cột số cuối cùng")
+
+        reasons[col] = reason_parts if reason_parts else ["không có dấu hiệu rõ ràng"]
+        if score > best_score:
+            best_score = score
+            best_y = col
+
+    # If no keyword matched at all, default to last numeric col
+    if best_y is None:
+        best_y = numeric_cols[-1]
+
+    best_x = [c for c in numeric_cols if c != best_y]
+
+    # Build explanation
+    y_reason = "; ".join(reasons.get(best_y, []))
+    explanation = (
+        f"🎯 **Gợi ý Y = `{best_y}`** — {y_reason}.\n\n"
+        f"📌 **Gợi ý X = {', '.join([f'`{c}`' for c in best_x])}** — các biến số còn lại.\n\n"
+        "Bạn có thể thay đổi lựa chọn bên dưới."
+    )
+
+    return best_y, best_x, numeric_cols, explanation
 
 
 def data_quality_report(df):
@@ -494,12 +646,15 @@ with st.sidebar:
 
     if uploaded:
         try:
-            df = load_data(uploaded)
-            if df is not None:
-                st.session_state["df"] = df
+            df_loaded, hdr_row = load_data(uploaded)
+            if df_loaded is not None:
+                st.session_state["df"] = df_loaded
                 st.session_state["filename"] = uploaded.name
+                st.session_state["header_row"] = hdr_row
                 st.success(f"✅ Đã tải: {uploaded.name}")
-                st.caption(f"{df.shape[0]} hàng × {df.shape[1]} cột")
+                st.caption(f"{df_loaded.shape[0]} hàng × {df_loaded.shape[1]} cột")
+                if hdr_row > 0:
+                    st.info(f"📌 Tự phát hiện header tại dòng {hdr_row + 1}")
         except Exception as e:
             st.error(f"Lỗi đọc file: {e}")
 
@@ -541,25 +696,33 @@ if df is None:
 # ── Section 1: Data Preview & Quality ─────────────────────────────────────
 st.markdown('<div class="section-hdr">① DỮ LIỆU & KIỂM TRA CHẤT LƯỢNG</div>', unsafe_allow_html=True)
 
+# Header detection notice
+hdr_row = st.session_state.get("header_row", 0)
+if hdr_row > 0:
+    st.markdown(
+        f'<div class="ok-box">✅ <b>Tự động phát hiện tiêu đề:</b> App đã bỏ qua {hdr_row} dòng trên cùng '
+        f'và dùng dòng {hdr_row + 1} làm tên cột. Dữ liệu hiển thị bên dưới đã đúng định dạng.</div>',
+        unsafe_allow_html=True
+    )
+
 col_prev, col_qual = st.columns([1.6, 1])
 
 with col_prev:
-    with st.expander("📋 Xem trước dữ liệu", expanded=True):
-        st.dataframe(df.head(20), use_container_width=True, height=260)
+    with st.expander("📋 Xem trước dữ liệu (20 dòng đầu)", expanded=True):
+        st.dataframe(df.head(20), use_container_width=True, height=270)
 
 with col_qual:
     st.markdown("**Báo cáo chất lượng dữ liệu**")
     issues = data_quality_report(df)
     level_map = {"ok": "ok-box", "warn": "warn-box", "err": "err-box", "info": "info-box"}
-    icon_map = {"ok": "✅", "warn": "⚠️", "err": "🚨", "info": "ℹ️"}
+    icon_map  = {"ok": "✅", "warn": "⚠️", "err": "🚨", "info": "ℹ️"}
     for iss in issues:
-        css = level_map.get(iss["level"], "info-box")
+        css  = level_map.get(iss["level"], "info-box")
         icon = icon_map.get(iss["level"], "•")
         st.markdown(f'<div class="{css}">{icon} {iss["msg"]}</div>', unsafe_allow_html=True)
 
-    # Quick stats
-    st.caption(f"Kích thước: {df.shape[0]} hàng × {df.shape[1]} cột")
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    st.caption(f"Kích thước: {df.shape[0]} hàng × {df.shape[1]} cột")
     st.caption(f"Cột số: {len(numeric_cols)} | Cột phi số: {df.shape[1] - len(numeric_cols)}")
 
 st.divider()
@@ -571,22 +734,59 @@ if len(numeric_cols) < 2:
     st.error("Cần ít nhất 2 cột số để thực hiện hồi quy.")
     st.stop()
 
+# ── Smart variable suggestion ─────────────────────────────────────────────
+sug_y, sug_x, _, sug_text = suggest_variables(df)
+
+with st.expander("🤖 Gợi ý biến tự động (click để xem / ẩn)", expanded=True):
+    st.markdown(sug_text)
+    # Correlation heatmap mini-table: show top correlations with suggested Y
+    if sug_y and len(numeric_cols) >= 2:
+        corr_series = df[numeric_cols].corr()[sug_y].drop(sug_y).sort_values(key=abs, ascending=False)
+        corr_df = corr_series.reset_index()
+        corr_df.columns = ["Biến X", f"Tương quan với {sug_y}"]
+        corr_df[f"Tương quan với {sug_y}"] = corr_df[f"Tương quan với {sug_y}"].round(4)
+
+        def color_corr(val):
+            try:
+                v = float(val)
+                if abs(v) >= 0.7:
+                    return "background-color:#1a3a2a; color:#3fb950"
+                elif abs(v) >= 0.4:
+                    return "background-color:#3a2d10; color:#d29922"
+                else:
+                    return "background-color:#2a1f1f; color:#8b949e"
+            except Exception:
+                return ""
+
+        styled = corr_df.style.applymap(color_corr, subset=[f"Tương quan với {sug_y}"])
+        st.dataframe(styled, use_container_width=True, hide_index=True, height=min(200, 35 * len(corr_df) + 38))
+        st.caption("🟢 |r| ≥ 0.7 mạnh · 🟡 0.4–0.7 trung bình · ⬜ < 0.4 yếu")
+
+st.markdown("")  # spacing
+
+# ── Variable selectors (pre-filled with suggestion) ───────────────────────
 col_cfg1, col_cfg2, col_cfg3 = st.columns([1, 1.2, 1])
+
+# Find suggested Y index for selectbox default
+sug_y_idx = numeric_cols.index(sug_y) if sug_y in numeric_cols else 0
 
 with col_cfg1:
     dep_var = st.selectbox(
         "🎯 Biến phụ thuộc (Y)",
         options=numeric_cols,
-        help="Biến bạn muốn dự báo / giải thích"
+        index=sug_y_idx,
+        help="Biến bạn muốn dự báo / giải thích. Đã được gợi ý tự động — có thể thay đổi."
     )
 
 with col_cfg2:
     ind_options = [c for c in numeric_cols if c != dep_var]
+    # Use suggested X, filtered to only valid options
+    default_x = [c for c in sug_x if c in ind_options] or (ind_options[:1] if ind_options else [])
     ind_vars = st.multiselect(
         "📌 Biến độc lập (X)",
         options=ind_options,
-        default=ind_options[:1] if ind_options else [],
-        help="Chọn một hoặc nhiều biến giải thích"
+        default=default_x,
+        help="Chọn một hoặc nhiều biến giải thích. Đã gợi ý tự động — có thể thêm/bỏ."
     )
 
 with col_cfg3:
@@ -610,10 +810,10 @@ with col_cfg3:
 
 # Model type info box
 MODEL_INFO = {
-    "Tuyến tính (Linear)":    "Hồi quy tuyến tính chuẩn. Phù hợp khi quan hệ Y~X là đường thẳng.",
-    "Bậc hai (Quadratic)":    "Thêm X² vào mô hình — phù hợp khi đồ thị phần dư có dạng cong (U-shape).",
-    "Bậc hai Centered":       "Bậc 2 với X được trừ giá trị trung bình — giảm đa cộng tuyến giữa X và X².",
-    "Logarithmic (Log Y)":    "Biến đổi ln(Y) trước khi hồi quy — phù hợp khi Y tăng theo cấp số nhân.",
+    "Tuyến tính (Linear)":     "Hồi quy tuyến tính chuẩn. Phù hợp khi quan hệ Y~X là đường thẳng.",
+    "Bậc hai (Quadratic)":     "Thêm X² vào mô hình — phù hợp khi đồ thị phần dư có dạng cong (U-shape).",
+    "Bậc hai Centered":        "Bậc 2 với X được trừ giá trị trung bình — giảm đa cộng tuyến giữa X và X².",
+    "Logarithmic (Log Y)":     "Biến đổi ln(Y) trước khi hồi quy — phù hợp khi Y tăng theo cấp số nhân.",
     "Tương tác (Interaction)": "Thêm tích X₁×X₂ — phù hợp khi ảnh hưởng của X₁ phụ thuộc vào X₂.",
 }
 st.markdown(f'<div class="info-box">ℹ️ <b>{model_type}</b>: {MODEL_INFO[model_type]}</div>', unsafe_allow_html=True)
