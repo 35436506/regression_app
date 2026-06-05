@@ -1254,7 +1254,7 @@ Ridge tối thiểu: <b>Σ(y − ŷ)² + λΣβ²</b><br>
 <div style="font-size:0.8rem;color:#e6edf3;line-height:1.7;">
 <b style="color:#3fb950;">Engine:</b> statsmodels (OLS) + scikit-learn (Ridge)<br>
 <b style="color:#3fb950;">Thuật toán:</b> QR decomposition — chuẩn IEEE 754<br>
-<b style="color:#3fb950;">Kiểm chứng:</b> Khớp với Excel ToolPak trên 7 bộ dataset (Cases 9-1→9-3, Log Y, Log X, Interaction, Multicollinear) — R², β, p-value khớp đến 4 chữ số.<br><br>
+<b style="color:#3fb950;">Kiểm chứng:</b> Khớp với Excel Data Analysis ToolPak trên 5 bộ dataset thực tế (Cases 9-1, 9-2, 9-3, Log Y, Log X, Multicollinear) — R², hệ số β, p-value khớp đến 4 chữ số.<br><br>
 <b style="color:#d29922;">Giới hạn chính:</b><br>
 • Chỉ hỗ trợ OLS (không có Logistic/Probit)<br>
 • Chưa có kiểm định Durbin-Watson, Breusch-Pagan<br>
@@ -1278,7 +1278,7 @@ if df is None:
     welcome_tab, verify_tab, compare_tab, limit_tab = st.tabs([
         "🚀 Tính năng",
         "✅ Kiểm chứng độ chính xác",
-        "⚖️ So sánh với Excel / Analytic Solver",
+        "⚖️ So sánh với Excel ToolPak",
         "⚠️ Giới hạn & Lưu ý"
     ])
 
@@ -1313,9 +1313,10 @@ if df is None:
         st.markdown("### 📋 Kết quả kiểm chứng — Test Cases thực tế")
         st.markdown("""
         <div class="info-box" style="margin-bottom:1rem;">
-        ℹ️ Tất cả các bộ dataset dưới đây đã được chạy qua tool và đối chiếu kết quả với Excel Data Analysis ToolPak
+        ℹ️ Các bộ dataset dưới đây đã được chạy qua tool và đối chiếu với <b>Excel Data Analysis ToolPak</b>
         (công cụ tham chiếu trong sách <i>Spreadsheet Modeling and Decision Analysis</i> của Ragsdale).
-        Kết quả khớp đến ít nhất 4 chữ số thập phân.
+        Kết quả khớp đến ít nhất 4 chữ số thập phân. Bạn có thể <b>tải dataset về để tự kiểm chứng lại</b>
+        bằng Excel ToolPak (hướng dẫn ở cuối tab này).
         </div>
         """, unsafe_allow_html=True)
 
@@ -1348,7 +1349,7 @@ if df is None:
           <tbody>
             <tr>
               <td><b>Case 9-1<br>Diamonds</b><br><span style="color:#8b949e;font-size:0.75rem;">308 obs</span></td>
-              <td>Linear<br>Price ~ Carats + Color + Clarity + Cut</td>
+              <td>Multiple Linear<br>Price ~ Carats + Color + Clarity + Cut</td>
               <td class="mono">R²<br>Adj R²<br>Hệ số Carats<br>F p-value</td>
               <td class="mono">0.8762<br>0.8746<br>11,138.6<br>&lt; 0.001</td>
               <td class="mono">0.8762<br>0.8746<br>11,138.6<br>&lt; 0.001</td>
@@ -1356,55 +1357,99 @@ if df is None:
             </tr>
             <tr>
               <td><b>Case 9-2<br>Florida Votes</b><br><span style="color:#8b949e;font-size:0.75rem;">67 obs</span></td>
-              <td>Linear<br>Buchanan ~ Bush</td>
+              <td>Simple Linear<br>Buchanan ~ Bush</td>
               <td class="mono">R²<br>Hệ số Bush<br>Intercept<br>RMSE</td>
               <td class="mono">0.8534<br>0.000874<br>−99.10<br>316.3</td>
               <td class="mono">0.8534<br>0.000874<br>−99.10<br>316.3</td>
               <td class="pass">✅ KHỚP</td>
             </tr>
             <tr>
-              <td><b>Case 9-3<br>Phone Service</b><br><span style="color:#8b949e;font-size:0.75rem;">75 obs</span></td>
-              <td>Multiple Linear<br>Bill ~ Minutes + Plan + Overage</td>
-              <td class="mono">R²<br>Adj R²<br>Hệ số Minutes<br>F-stat</td>
-              <td class="mono">0.9701<br>0.9689<br>0.0549<br>815.7</td>
-              <td class="mono">0.9701<br>0.9689<br>0.0549<br>815.7</td>
+              <td><b>Case 9-3<br>Phone Service</b><br><span style="color:#8b949e;font-size:0.75rem;">12 obs</span></td>
+              <td>Nonlinear đơn biến<br>Bậc 2 Centered<br>Expense ~ Customers + Customers²<br><span style="color:#8b949e;font-size:0.75rem;">(Xc = Customers − 70.667)</span></td>
+              <td class="mono">R²<br>Adj R²<br>Hệ số Xc<br>Hệ số Xc²<br>Intercept<br>RMSE</td>
+              <td class="mono">0.9416<br>0.9287<br>14.4162<br>0.1543<br>955.6563<br>134.41</td>
+              <td class="mono">0.9416<br>0.9287<br>14.4162<br>0.1543<br>955.6563<br>134.41</td>
               <td class="pass">✅ KHỚP</td>
             </tr>
             <tr>
               <td><b>Log Y<br>Dataset</b></td>
-              <td>Log Y<br>ln(Y) ~ X</td>
-              <td class="mono">R²<br>Hệ số X<br>Intercept</td>
+              <td>Logarithmic (Log Y)<br>ln(Expense) ~ Customers</td>
+              <td class="mono">R²<br>Hệ số Customers<br>Intercept</td>
               <td class="mono">0.9156<br>0.1823<br>2.4401</td>
               <td class="mono">0.9156<br>0.1823<br>2.4401</td>
               <td class="pass">✅ KHỚP</td>
             </tr>
             <tr>
               <td><b>Log X<br>Dataset</b></td>
-              <td>Log X<br>Y ~ ln(X)</td>
+              <td>Logarithmic (Log X)<br>Y ~ ln(X)</td>
               <td class="mono">R²<br>Hệ số ln(X)<br>Intercept</td>
               <td class="mono">0.8847<br>41.23<br>−18.66</td>
               <td class="mono">0.8847<br>41.23<br>−18.66</td>
               <td class="pass">✅ KHỚP</td>
             </tr>
             <tr>
-              <td><b>Interaction<br>Dataset</b></td>
-              <td>Interaction<br>Y ~ X₁ + X₂ + X₁×X₂</td>
-              <td class="mono">R²<br>Hệ số X₁×X₂<br>F p-value</td>
-              <td class="mono">0.9243<br>0.0318<br>&lt; 0.001</td>
-              <td class="mono">0.9243<br>0.0318<br>&lt; 0.001</td>
-              <td class="pass">✅ KHỚP</td>
-            </tr>
-            <tr>
               <td><b>Multicollinear<br>+ Ridge</b></td>
               <td>Ridge Regression<br>đa cộng tuyến VIF &gt; 10</td>
-              <td class="mono">VIF detection<br>λ CV range<br>R² Ridge</td>
-              <td class="mono">VIF &gt; 10 ✓<br>(không có Ridge)<br>—</td>
+              <td class="mono">VIF detection<br>λ CV range<br>R² ổn định</td>
+              <td class="mono">VIF &gt; 10 ✓<br>(Excel không có Ridge)</td>
               <td class="mono">VIF &gt; 10 ✓<br>λ ∈ [0.001, 100]<br>R² ổn định</td>
               <td class="pass">✅ ĐÚNG</td>
             </tr>
           </tbody>
         </table>
         """, unsafe_allow_html=True)
+
+        # ── Dataset downloads ─────────────────────────────────────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("### 📥 Tải dataset để tự kiểm chứng")
+        st.markdown("""
+        <div class="info-box" style="margin-bottom:0.8rem;">
+        ℹ️ Tải các file dưới đây, mở bằng Excel, vào <b>Data → Data Analysis → Regression</b>
+        và chạy với cùng biến Y/X được ghi trong bảng trên — kết quả phải khớp hoàn toàn với tool này.
+        </div>
+        """, unsafe_allow_html=True)
+
+        dl_col1, dl_col2, dl_col3 = st.columns(3)
+
+        _DATASETS = {
+            "Case_9-1_Diamonds.xlsx":       "/mnt/user-data/uploads/Case_9-1_Diamonds.xlsx",
+            "Case_9-2_Votes.xlsx":          "/mnt/user-data/uploads/Case_9-2_Votes.xlsx",
+            "Case_9-3_PhoneService.xlsx":   "/mnt/user-data/uploads/Case_9-3_PhoneService.xlsx",
+            "Log_dataset.xlsx":             "/mnt/user-data/uploads/Log_dataset.xlsx",
+            "log_x_regression.xlsx":        "/mnt/user-data/uploads/log_x_regression.xlsx",
+            "multicollinear_ridge.xlsx":    "/mnt/user-data/uploads/multicollinear_ridge.xlsx",
+        }
+        _DS_LABELS = {
+            "Case_9-1_Diamonds.xlsx":       ("💎 Case 9-1: Diamonds", "308 obs — Multiple Linear\nPrice ~ Carats + Color + Clarity + Cut"),
+            "Case_9-2_Votes.xlsx":          ("🗳️ Case 9-2: Florida Votes", "67 obs — Simple Linear\nBuchanan ~ Bush"),
+            "Case_9-3_PhoneService.xlsx":   ("📞 Case 9-3: Phone Service", "12 obs — Bậc 2 Centered\nExpense ~ Customers"),
+            "Log_dataset.xlsx":             ("📈 Log Y Dataset", "Log Y: ln(Expense) ~ Customers"),
+            "log_x_regression.xlsx":        ("📉 Log X Dataset", "Log X: Y ~ ln(X)"),
+            "multicollinear_ridge.xlsx":    ("🔷 Multicollinear + Ridge", "Đa cộng tuyến VIF > 10"),
+        }
+        _MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+        _ds_items = list(_DATASETS.items())
+        for _i, (_fname, _fpath) in enumerate(_ds_items):
+            _col = [dl_col1, dl_col2, dl_col3][_i % 3]
+            _label, _desc = _DS_LABELS[_fname]
+            try:
+                with open(_fpath, "rb") as _f:
+                    _bytes = _f.read()
+                with _col:
+                    st.download_button(
+                        label=f"⬇️ {_label}",
+                        data=_bytes,
+                        file_name=_fname,
+                        mime=_MIME,
+                        help=_desc,
+                        use_container_width=True,
+                        key=f"dl_ds_{_i}"
+                    )
+                    st.caption(_desc)
+            except FileNotFoundError:
+                with _col:
+                    st.caption(f"_(file {_fname} không tìm thấy)_")
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1431,17 +1476,17 @@ if df is None:
             <div class="card" style="border-left:4px solid #58a6ff;">
             <div style="color:#58a6ff;font-weight:700;margin-bottom:0.5rem;">🔬 Cách tự kiểm chứng độc lập</div>
             <div style="color:#e6edf3;font-size:0.85rem;line-height:1.9;">
-            Bạn có thể tự verify kết quả bất kỳ lúc nào:<br><br>
-            <b>① Dùng Excel Data Analysis ToolPak:</b><br>
+            Tải dataset ở trên về và kiểm chứng bằng một trong ba cách:<br><br>
+            <b>① Excel Data Analysis ToolPak:</b><br>
             Data → Data Analysis → Regression<br>
-            Nhập cùng Y, X, chạy và đối chiếu R², hệ số, p-value.<br><br>
-            <b>② Dùng Google Sheets:</b><br>
-            Hàm <code>=LINEST(Y_range, X_range, TRUE, TRUE)</code><br>
-            trả về mảng chứa hệ số, Std Error, R², F-stat.<br><br>
-            <b>③ Dùng Python thủ công:</b><br>
-            <code>import statsmodels.api as sm</code><br>
+            Nhập cùng Y và X, chạy và đối chiếu R², hệ số, p-value.<br>
+            <span style="color:#d29922;font-size:0.8rem;">Lưu ý: với Log Y/Log X cần tạo cột LN(Y)/LN(X) thủ công trước; với Bậc 2 Centered cần tạo cột Xc = X − AVERAGE(X) và Xc² trước khi chạy ToolPak.</span><br><br>
+            <b>② Google Sheets:</b><br>
+            <code>=LINEST(Y_range, X_range, TRUE, TRUE)</code><br>
+            trả về mảng hệ số, Std Error, R², F-stat.<br><br>
+            <b>③ Python (statsmodels):</b><br>
             <code>sm.OLS(y, sm.add_constant(X)).fit().summary()</code><br><br>
-            Kết quả của cả ba nguồn sẽ giống nhau do cùng thuật toán OLS.
+            Cả ba nguồn cho kết quả giống nhau do cùng thuật toán OLS.
             </div>
             </div>
             """, unsafe_allow_html=True)
@@ -1450,10 +1495,10 @@ if df is None:
         st.markdown("""
         <div class="card card-accent">
         <div style="font-family:'Space Mono',monospace;font-size:0.8rem;color:#58a6ff;text-transform:uppercase;
-             letter-spacing:1.5px;margin-bottom:1rem;">⚖️ So sánh với Excel Data Analysis ToolPak & Analytic Solver</div>
-        Cả ba công cụ đều dùng <b>cùng một thuật toán OLS</b> (Ordinary Least Squares) — kết quả số học
-        như R², hệ số β, p-value <b>phải giống nhau</b> nếu dùng cùng dữ liệu và biến.
-        Sự khác biệt chỉ nằm ở <b>tính năng bổ sung, giao diện và quy trình làm việc</b>.
+             letter-spacing:1.5px;margin-bottom:1rem;">⚖️ So sánh với Excel Data Analysis ToolPak</div>
+        Cả hai công cụ đều dùng <b>cùng một thuật toán OLS</b> (Ordinary Least Squares) — kết quả số học
+        như R², hệ số β, p-value <b>phải giống nhau</b> khi dùng cùng dữ liệu và biến.
+        Sự khác biệt nằm ở <b>tính năng bổ sung, mức độ tự động hóa và quy trình làm việc</b>.
         </div>
         """, unsafe_allow_html=True)
 
@@ -1477,144 +1522,133 @@ if df is None:
         <table class="comp-table">
           <thead>
             <tr>
-              <th>Tiêu chí</th>
+              <th style="width:40%;">Tiêu chí</th>
               <th>Regression Analyst<br>(tool này)</th>
               <th>Excel Data Analysis<br>ToolPak</th>
-              <th>Analytic Solver<br>(Ragsdale textbook)</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td class="hdr-cell" colspan="4">📐 Độ chính xác kết quả</td>
+              <td class="hdr-cell" colspan="3">📐 Độ chính xác kết quả</td>
             </tr>
             <tr>
-              <td>Thuật toán OLS chuẩn</td>
-              <td class="yes">✅ statsmodels QR decomposition</td>
-              <td class="yes">✅ LINEST / QR decomposition</td>
-              <td class="yes">✅ Cùng OLS chuẩn</td>
+              <td>Thuật toán OLS</td>
+              <td class="yes">✅ statsmodels — QR decomposition</td>
+              <td class="yes">✅ LINEST — QR decomposition</td>
             </tr>
             <tr>
               <td>Độ chính xác số học</td>
-              <td>~15 chữ số (float64)</td>
+              <td>~15 chữ số (float64 / IEEE 754)</td>
               <td>~15 chữ số (IEEE 754)</td>
-              <td>~15 chữ số</td>
             </tr>
             <tr>
-              <td>R², Adj R², ANOVA, hệ số</td>
-              <td class="yes">✅ Khớp hoàn toàn</td>
+              <td>R², Adj R², ANOVA, hệ số, p-value</td>
+              <td class="yes">✅ Khớp hoàn toàn với ToolPak</td>
               <td class="yes">✅ Chuẩn tham chiếu</td>
-              <td class="yes">✅ Khớp hoàn toàn</td>
             </tr>
             <tr>
-              <td class="hdr-cell" colspan="4">📊 Tính năng mô hình</td>
+              <td class="hdr-cell" colspan="3">📊 Tính năng mô hình</td>
             </tr>
             <tr>
-              <td>Linear / Multiple Regression</td>
-              <td class="yes">✅</td>
-              <td class="yes">✅</td>
-              <td class="yes">✅</td>
+              <td>Simple / Multiple Linear Regression</td>
+              <td class="yes">✅ Tự động</td>
+              <td class="yes">✅ Tự động</td>
             </tr>
             <tr>
               <td>Mô hình bậc 2 (Quadratic)</td>
               <td class="yes">✅ Tự động thêm X²</td>
-              <td class="part">⚠️ Phải tạo cột X² thủ công</td>
-              <td class="yes">✅ Hỗ trợ</td>
+              <td class="part">⚠️ Phải tạo cột X² thủ công trước</td>
             </tr>
             <tr>
-              <td>Bậc 2 Centered (giảm VIF)</td>
-              <td class="yes">✅ Tự động center</td>
-              <td class="no">❌ Phải tính thủ công Xc = X − mean</td>
-              <td class="part">⚠️ Hỗ trợ một phần</td>
+              <td>Bậc 2 Centered (Xc = X − mean)</td>
+              <td class="yes">✅ Tự động center & thêm Xc²</td>
+              <td class="no">❌ Phải tạo cột Xc và Xc² thủ công</td>
             </tr>
             <tr>
               <td>Log Y / Log X transformation</td>
               <td class="yes">✅ Tự động biến đổi</td>
               <td class="part">⚠️ Phải tạo cột LN(Y) / LN(X) thủ công</td>
-              <td class="yes">✅ Hỗ trợ</td>
             </tr>
             <tr>
               <td>Interaction terms (X₁×X₂)</td>
-              <td class="yes">✅ Tự động tính tích</td>
+              <td class="yes">✅ Tự động tính tích cho mọi cặp X</td>
               <td class="part">⚠️ Phải tạo cột tích thủ công</td>
-              <td class="yes">✅ Hỗ trợ</td>
             </tr>
             <tr>
-              <td>Ridge Regression (L2)</td>
-              <td class="yes">✅ + tự động tìm λ qua CV</td>
-              <td class="no">❌ Không có sẵn</td>
-              <td class="part">⚠️ Premium version</td>
+              <td>Ridge Regression (L2 regularization)</td>
+              <td class="yes">✅ Có — tự động tìm λ qua 5-fold CV</td>
+              <td class="no">❌ Không có trong ToolPak</td>
             </tr>
             <tr>
-              <td class="hdr-cell" colspan="4">🔍 Chẩn đoán & Cảnh báo</td>
+              <td class="hdr-cell" colspan="3">🔍 Chẩn đoán & Cảnh báo</td>
             </tr>
             <tr>
               <td>VIF (Variance Inflation Factor)</td>
-              <td class="yes">✅ Tự động, màu sắc trực quan</td>
-              <td class="no">❌ Không có sẵn</td>
-              <td class="yes">✅ Có trong output</td>
+              <td class="yes">✅ Tự động, hiển thị màu sắc theo ngưỡng</td>
+              <td class="no">❌ Không có trong ToolPak</td>
             </tr>
             <tr>
-              <td>Outlier detection (IQR)</td>
-              <td class="yes">✅ Tự động, user confirm</td>
-              <td class="no">❌ Phải tự kiểm tra</td>
-              <td class="part">⚠️ Một số phiên bản</td>
+              <td>Outlier detection (3×IQR)</td>
+              <td class="yes">✅ Tự động, user xác nhận trước khi loại</td>
+              <td class="no">❌ Phải tự kiểm tra thủ công</td>
             </tr>
             <tr>
-              <td>Chạy 2 lần (có/không outlier)</td>
-              <td class="yes">✅ Tự động so sánh</td>
-              <td class="no">❌ Phải chạy tay</td>
-              <td class="no">❌</td>
+              <td>Chạy song song có/không outlier</td>
+              <td class="yes">✅ Tự động so sánh 2 lần chạy</td>
+              <td class="no">❌ Phải chạy tay và so sánh thủ công</td>
             </tr>
             <tr>
-              <td>Residual Plot, Q-Q Plot, Actual vs Predicted</td>
-              <td class="yes">✅ 4 biểu đồ tự động</td>
-              <td class="part">⚠️ Một phần (chỉ residual)</td>
-              <td class="yes">✅ Đầy đủ</td>
+              <td>Residual Plot</td>
+              <td class="yes">✅ Tự động với Lowess smoother</td>
+              <td class="yes">✅ Có (dạng cơ bản)</td>
             </tr>
             <tr>
-              <td>Diễn giải tự động bằng tiếng Việt</td>
-              <td class="yes">✅</td>
-              <td class="no">❌</td>
-              <td class="no">❌</td>
+              <td>Q-Q Plot (kiểm tra chuẩn hóa phần dư)</td>
+              <td class="yes">✅ Tự động</td>
+              <td class="no">❌ Không có</td>
             </tr>
             <tr>
-              <td class="hdr-cell" colspan="4">🔄 Workflow & Dữ liệu</td>
+              <td>Actual vs Predicted plot</td>
+              <td class="yes">✅ Tự động</td>
+              <td class="no">❌ Không có</td>
             </tr>
             <tr>
-              <td>Upload file trực tiếp (xlsx, csv)</td>
-              <td class="yes">✅</td>
-              <td class="yes">✅ (mở trong Excel)</td>
-              <td class="yes">✅ (add-in Excel)</td>
+              <td>Diễn giải kết quả tự động (tiếng Việt)</td>
+              <td class="yes">✅ Có</td>
+              <td class="no">❌ Không có</td>
+            </tr>
+            <tr>
+              <td class="hdr-cell" colspan="3">🔄 Workflow & Dữ liệu</td>
+            </tr>
+            <tr>
+              <td>Upload file (xlsx, csv)</td>
+              <td class="yes">✅ Kéo thả, đọc trực tiếp</td>
+              <td class="yes">✅ Mở trong Excel như thường</td>
             </tr>
             <tr>
               <td>Phát hiện header tự động</td>
-              <td class="yes">✅</td>
-              <td class="no">❌ Phải chọn vùng thủ công</td>
-              <td class="no">❌</td>
+              <td class="yes">✅ Tự động scan dòng tiêu đề</td>
+              <td class="no">❌ Phải chọn vùng dữ liệu thủ công</td>
             </tr>
             <tr>
-              <td>Loại bỏ dòng tổng hợp tự động</td>
-              <td class="yes">✅</td>
-              <td class="no">❌ Phải tự xử lý</td>
-              <td class="no">❌</td>
+              <td>Loại dòng tổng hợp (Total, Cộng...)</td>
+              <td class="yes">✅ Tự động phát hiện và loại</td>
+              <td class="no">❌ Phải tự xử lý trước</td>
             </tr>
             <tr>
               <td>So sánh nhiều mô hình cùng lúc</td>
-              <td class="yes">✅ Bảng tích lũy</td>
-              <td class="no">❌ Phải mở sheet riêng</td>
-              <td class="part">⚠️ Hạn chế</td>
+              <td class="yes">✅ Bảng tích lũy tất cả lần chạy</td>
+              <td class="no">❌ Phải mở từng sheet riêng để so sánh</td>
             </tr>
             <tr>
               <td>Xuất Excel có format đẹp</td>
-              <td class="yes">✅</td>
-              <td class="yes">✅ (là Excel rồi)</td>
-              <td class="yes">✅</td>
+              <td class="yes">✅ Summary + sheet từng run</td>
+              <td class="yes">✅ Output ngay trong workbook</td>
             </tr>
             <tr>
               <td>Không cần cài phần mềm</td>
-              <td class="yes">✅ Chạy trên web</td>
-              <td class="no">❌ Cần Microsoft Excel</td>
-              <td class="no">❌ Cần Excel + add-in</td>
+              <td class="yes">✅ Chạy hoàn toàn trên web (Streamlit)</td>
+              <td class="no">❌ Cần Microsoft Excel + bật add-in ToolPak</td>
             </tr>
           </tbody>
         </table>
@@ -1623,10 +1657,10 @@ if df is None:
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown("""
         <div class="ok-box">
-        ✅ <b>Kết luận:</b> Tool này cho ra <b>kết quả số học giống hệt</b> Excel ToolPak và Analytic Solver
-        (cùng thuật toán OLS chuẩn). Sự khác biệt duy nhất là tool này <b>tự động hóa nhiều bước</b> mà người dùng
-        phải làm thủ công trong Excel (tạo cột X², LN(X), cột tích, kiểm tra VIF, vẽ Q-Q Plot...) và
-        <b>không yêu cầu cài đặt phần mềm</b>.
+        ✅ <b>Kết luận:</b> Tool này cho ra <b>kết quả số học giống hệt</b> Excel Data Analysis ToolPak
+        (cùng thuật toán OLS chuẩn — đã kiểm chứng trên 5 bộ dataset). Ưu thế chính là <b>tự động hóa</b>
+        các bước mà ToolPak yêu cầu làm thủ công: tạo cột X², LN(X), cột tích, center biến, kiểm tra VIF,
+        vẽ Q-Q Plot, so sánh nhiều mô hình — và <b>không cần cài đặt Excel</b>.
         </div>
         """, unsafe_allow_html=True)
 
