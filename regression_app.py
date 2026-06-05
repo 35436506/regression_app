@@ -1313,8 +1313,7 @@ if df is None:
         st.markdown("### 📋 Kết quả kiểm chứng — Test Cases thực tế")
         st.markdown("""
         <div class="info-box" style="margin-bottom:1rem;">
-        ℹ️ Các bộ dataset dưới đây đã được chạy qua tool và đối chiếu với <b>Excel Data Analysis ToolPak</b>
-        (công cụ tham chiếu trong sách <i>Spreadsheet Modeling and Decision Analysis</i> của Ragsdale).
+        ℹ️ Các bộ dataset dưới đây đã được chạy qua tool và đối chiếu với <b>Excel Data Analysis ToolPak</b>.
         Kết quả khớp đến ít nhất 4 chữ số thập phân. Bạn có thể <b>tải dataset về để tự kiểm chứng lại</b>
         bằng Excel ToolPak (hướng dẫn ở cuối tab này).
         </div>
